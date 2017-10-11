@@ -23,7 +23,8 @@
   },
   "license": "ISC",
   "dependencies": {
-    "async": "^2.0.0",
-    "aws-sdk": "^2.4.7"
+    "aws-sdk": "^2.4.7",
+    "bluebird": "^3.5.1",
+    "commander": "^2.11.0"
   }
 }

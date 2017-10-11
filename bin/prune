@@ -1,93 +1,148 @@
 #!/usr/bin/env node
+'use strict'
+const AWS = require('aws-sdk')
+const Promise = require('bluebird')
+const program = require('commander')
+const packageJson = require('../package.json')
 
-'use strict';
+const accessKeyId = process.env.AWS_ACCESS_KEY_ID || process.env.AWS_ACCESS_KEY
+const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY || process.env.AWS_SECRET_KEY
+const region = process.env.AWS_REGION || 'us-east-1'
 
-var AWS = require( 'aws-sdk' );
-var async = require( 'async' );
-
-var accessKeyId = process.env.AWS_ACCESS_KEY_ID;
-var secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
-var region = process.env.AWS_REGION;
-
-function exit( err ) {
-  if ( err ) console.log( err );
-  process.exit( err ? 1 : 0 );
+function exit (err) {
+  if (err) console.log(err)
+  process.exit(err ? 1 : 0)
 }
 
-var keep = 3;
-var functionName;
-
-var Usage = [ process.argv[1],
-	      "[ --keep num ]",
-	      "functionName" ].join( ' ' );
-
-var arg;
-process.argv.shift(); process.argv.shift();
-while( arg = process.argv.shift() ) {
-  if ( arg == '--help' ) { console.log( Usage ); exit(); }
-  if ( arg == '--keep' ) { keep = process.argv.shift(); }
-  functionName = arg;
+if (!(accessKeyId && secretAccessKey && region)) {
+  console.log('One or more of the following environment variables are not set.  All three must be set.')
+  console.log('  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION')
+  exit()
 }
 
-if ( ! functionName ) {
-  console.log( Usage );
-  exit();
-}
-
-if ( ! ( accessKeyId && secretAccessKey && region ) ) {
-  console.log( 'One or more of the following environment variables are not set.  All three must be set.' );
-  console.log( '  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION' );
-  exit();
-}
-
-var lambda = new AWS.Lambda({
+const lambda = new AWS.Lambda({
   accessKeyId: accessKeyId,
   secretAccessKey: secretAccessKey,
-  region: region,
-});
+  region: region
+})
 
-lambda.listVersionsByFunction({ FunctionName: functionName }, function( err, data ) {
-  if ( err ) exit( err );
+const deleteFunctionByQualifier = (functionName, qualifier) => {
+  return lambda.deleteFunction({ FunctionName: functionName, Qualifier: qualifier }).promise()
+}
 
-  var sorted = data.Versions.sort( function( v1, v2 ) {
-    if ( v1.LastModified < v2.LastModified ) {
-      return 1;
-    } else {
-      if( v1.LastModified > v2.LastModified ) {
-        return -1;
-      } else {
-        return 0;
+const listAllVersionsByFunction = (functionName) => {
+  return new Promise((resolve, reject) => {
+    let fns = [];
+    (function _listAllVersionsByFunction (nextMarker) {
+      const opts = {
+        FunctionName: functionName
       }
-    }
-  });
-
-  lambda.listAliases({ FunctionName: functionName }, function( err, data ) {
-    if ( err ) exit( err );
-
-    // keep any version that is pointed to by an alias
-    var keepVersions = data.Aliases.map(function(a){
-      return a.FunctionVersion;
-    });
-
-    sorted.forEach( function( v ) {
-      if ( (v.Version == '$LATEST') || (keepVersions.indexOf( v.Version ) >= 0) ) {
-	v.KEEP = true;
+      if (nextMarker) {
+        opts.Marker = nextMarker
       }
-      else if ( keep > 0 ) {
-	v.KEEP = true;
-	keep--;
-      }
-    });
+      lambda.listVersionsByFunction(opts, (err, data) => {
+        if (err) {
+          return reject(err)
+        }
+        fns = fns.concat(data.Versions)
+        if (data.NextMarker) {
+          _listAllVersionsByFunction(data.NextMarker)
+        } else {
+          resolve(fns)
+        }
+      })
+    })()
+  })
+}
 
-    async.eachSeries( sorted, function( v, cb ) {
-      if ( v.KEEP ) {
-	console.log( 'Keeping', v.Version );
-	return cb();
-      }
-      else {
-	lambda.deleteFunction({ FunctionName: functionName, Qualifier: v.Version }, cb );
-      }
-    }, exit );
+const deleteByFunctionName = (functionName) => {
+  return new Promise((resolve, reject) => {
+    listAllVersionsByFunction(functionName).then(versions => {
+      const sorted = versions.sort(function (v1, v2) {
+        if (v1.LastModified < v2.LastModified) {
+          return 1
+        } else {
+          if (v1.LastModified > v2.LastModified) {
+            return -1
+          } else {
+            return 0
+          }
+        }
+      })
 
-  });
-});
+      lambda.listAliases({ FunctionName: functionName }, function (err, data) {
+        if (err) exit(err)
+
+        // keep any version that is pointed to by an alias
+        const keepVersions = data.Aliases.map(function (a) {
+          return a.FunctionVersion
+        })
+
+        let keep = 3
+
+        sorted.forEach(function (v) {
+          if ((v.Version === '$LATEST') || (keepVersions.indexOf(v.Version) >= 0)) {
+            v.KEEP = true
+          } else if (keep > 0) {
+            v.KEEP = true
+            keep--
+          }
+        })
+
+        Promise.map(sorted, v => {
+          if (!v.KEEP) {
+            console.log('Deleting', v.Version)
+            return deleteFunctionByQualifier(functionName, v.Version)
+          } else {
+            console.log('Keeping', v.Version)
+          }
+          return null
+        }, { concurrency: 2 })
+            .then(resolve)
+            .catch(reject)
+      })
+    })
+  })
+}
+
+const listAllFunctions = () => {
+  return new Promise((resolve, reject) => {
+    let fns = [];
+    (function _listAllFunctions (nextMarker) {
+      const opts = {}
+      if (nextMarker) {
+        opts.Marker = nextMarker
+      }
+      lambda.listFunctions(opts, (err, data) => {
+        if (err) {
+          return reject(err)
+        }
+        fns = fns.concat(data.Functions)
+        if (data.NextMarker) {
+          _listAllFunctions(data.NextMarker)
+        } else {
+          resolve(fns)
+        }
+      })
+    })()
+  })
+}
+
+program
+  .version(packageJson.version)
+  .command('prune <startsWith>')
+  .action(function (startsWith) {
+    listAllFunctions().then(fns => {
+      return Promise.mapSeries(fns, fn => {
+        if (fn.FunctionName.indexOf(startsWith) === 0) {
+          console.log(fn.FunctionName)
+          return deleteByFunctionName(fn.FunctionName)
+        }
+      })
+    })
+      .catch(err => {
+        console.log('err', err)
+      })
+  })
+
+program.parse(process.argv)
